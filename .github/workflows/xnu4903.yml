@@ -12,17 +12,13 @@ on:
       machine_config:
         description: "T7000 = A8 (iPhone 6). Outras: S5L8960X (A7), S8000 (A9)"
         default: "T7000"
-      sdk:
-        description: "iphoneos (recomendado) ou macosx"
-        default: "iphoneos"
       keep_going:
         description: "make -k: continua apos erro para listar todos de uma vez"
         default: "true"
   push:
     branches: [main]
     paths:
-      - "a30s-xnu4903/xnu/patches/**"
-      - "a30s-xnu4903/ci/**"
+      - "ci/**"
       - ".github/workflows/xnu4903.yml"
 
 concurrency:
@@ -33,44 +29,47 @@ jobs:
   build:
     runs-on: macos-15
     timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        sdk: [iphoneos, macosx]
     steps:
       - uses: actions/checkout@v4
 
       - name: Escolher Xcode mais antigo da imagem
         run: |
           XC=$(ls -d /Applications/Xcode_*.app | sort -V | head -1)
-          XC=$(perl -MCwd -e 'print Cwd::realpath($ARGV[0])' "$XC")
+          XC=$(realpath "$XC")
           echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
-          sudo xcode-select -s "$XC/Contents/Developer"
+          sudo xcode-select -s "$XC"
           xcodebuild -version
-          ls -d /Applications/Xcode*.app
 
       - name: Compilar XNU
         env:
           XNU_TAG: ${{ inputs.xnu_tag || 'xnu-4903.270.47' }}
           KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
           MACHINE_CONFIG: ${{ inputs.machine_config || 'T7000' }}
-          SDK: ${{ inputs.sdk || 'iphoneos' }}
+          SDK: ${{ matrix.sdk }}
           MAKE_KEEP_GOING: ${{ inputs.keep_going == 'false' && '' || '1' }}
         run: |
-          bash a30s-xnu4903/ci/build4903.sh 2>&1 | tee build.log
+          bash ci/build4903.sh 2>&1 | tee build.log
           exit ${PIPESTATUS[0]}
 
-      - name: Empacotar arvore de build (so texto/headers) para depurar
+      - name: Empacotar arvore de build
         if: always()
         run: |
           tar czf buildtree.tgz --exclude='*.o' --exclude='*.a' --exclude='*.dSYM' --exclude='.git' \
-            -C a30s-xnu4903/work build fakeroot/usr/local/include 2>/dev/null || true
+            -C work build fakeroot/usr/local/include 2>/dev/null || true
           ls -la buildtree.tgz || true
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: xnu4903-logs
+          name: xnu4903-logs-${{ matrix.sdk }}
           path: |
             build.log
-            a30s-xnu4903/out/*.log
-            a30s-xnu4903/out/report.txt
+            out/*.log
+            out/report.txt
             buildtree.tgz
           retention-days: 14
           if-no-files-found: warn
@@ -78,7 +77,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: xnu4903-kernel
-          path: a30s-xnu4903/out/kernel/
+          name: xnu4903-kernel-${{ matrix.sdk }}
+          path: out/kernel/
           retention-days: 30
           if-no-files-found: warn

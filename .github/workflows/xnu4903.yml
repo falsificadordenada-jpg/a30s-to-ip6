@@ -39,8 +39,9 @@ jobs:
       - name: Escolher Xcode mais antigo da imagem
         run: |
           XC=$(ls -d /Applications/Xcode_*.app | sort -V | head -1)
+          XC=$(perl -MCwd -e 'print Cwd::realpath($ARGV[0])' "$XC")
           echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
-          sudo xcode-select -s "$XC"
+          sudo xcode-select -s "$XC/Contents/Developer"
           xcodebuild -version
           ls -d /Applications/Xcode*.app
 

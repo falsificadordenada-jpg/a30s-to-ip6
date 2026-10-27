@@ -29,6 +29,11 @@ NCPU="$(sysctl -n hw.ncpu 2>/dev/null || echo 4)"
 PCPU="$(sysctl -n hw.physicalcpu 2>/dev/null || echo 2)"
 MEM="$(sysctl -n hw.memsize 2>/dev/null || echo 8589934592)"
 
+# o runner tem Xcode_15.0.app como link p/ 15.0.1; resolve p/ nao misturar caminhos
+if XP="$(xcode-select -p 2>/dev/null)" && [ -d "$XP" ]; then
+  DEVELOPER_DIR="$(perl -MCwd -e 'print Cwd::realpath($ARGV[0])' "$XP")"; export DEVELOPER_DIR
+fi
+
 say() { echo "[$(date +%H:%M:%S)] $*"; }
 FAILED=0
 # stage NOME comando... : roda numa subshell com set -e, log em out/NOME.log
@@ -80,22 +85,42 @@ do_compat() {
   sed -i '' "s|^LDFLAGS_KERNEL_SDK[[:space:]]*= -L\$(SDKROOT)/usr/local/lib/kernel|LDFLAGS_KERNEL_SDK = -L$FR/usr/local/lib/kernel|" makedefs/MakeInc.def
   sed -i '' "s|^INCFLAGS_SDK[[:space:]]*= -I\$(SDKROOT)/usr/local/include/kernel|INCFLAGS_SDK = -I$FR/usr/local/include/kernel|" makedefs/MakeInc.def
   sed -i '' 's|^#include.*BSD.xcconfig.*||g' libsyscall/Libsyscall.xcconfig
+  # Scripts Python 2 do xnu (o macOS 14 nao tem /usr/bin/python): usamos reescritas nossas em py3
+  cp "$ROOT/ci/py3/makekdebugevents.py" bsd/kern/makekdebugevents.py
+  cp "$ROOT/ci/py3/generate_dynamic_blacklist.py" san/tools/generate_dynamic_blacklist.py
+  chmod +x bsd/kern/makekdebugevents.py san/tools/generate_dynamic_blacklist.py
+  # o alvo "install" completo chama checkstyle (tools/uncrustify.sh nao existe no fonte publico)
+  sed -i '' 's/install_aliases checkstyle$/install_aliases/' makedefs/MakeInc.top
   grep -n "LDFLAGS_KERNEL_SDK\|INCFLAGS_SDK" makedefs/MakeInc.def | head
+  python3 -I bsd/kern/makekdebugevents.py /dev/null >/dev/null && echo 'py3 makekdebugevents ok'
+  grep -n "^install:" makedefs/MakeInc.top
 }
 
 # ---------------------------------------------------------------- ferramentas
 do_tools() {
-  cd "$WORK/AvailabilityVersions"
-  make install -j"$NCPU" OBJROOT="$BLD/" SYMROOT="$BLD/" DSTROOT="$FR"
+  mkdir -p "$FR/usr/local/libexec"
+  cp "$WORK/AvailabilityVersions/availability.pl" "$FR/usr/local/libexec/availability.pl"
+  chmod +x "$FR/usr/local/libexec/availability.pl"
   test -x "$FR/usr/local/libexec/availability.pl"
-  for t in mig migcom ctfconvert ctfmerge ctf_insert unifdef; do
+  for t in mig migcom ctfconvert ctfmerge ctf_insert unifdef python3; do
     printf '%-12s ' "$t"; xcrun -sdk "$SDK" -find "$t" 2>&1 || true
   done
   xcrun -sdk "$SDK" -find mig >/dev/null
   xcrun -sdk "$SDK" -find migcom >/dev/null
-  echo "embedded_device_map:"; xcrun -sdk "$SDK" -find embedded_device_map 2>&1 || echo "(ausente: ok, usamos TARGET_CONFIGS explicito)"
   xcrun -sdk "$SDK" -show-sdk-path; xcrun -sdk "$SDK" -show-sdk-version
 }
+
+# ctfconvert/ctfmerge nao vem no Xcode: compilamos do projeto dtrace (opcional)
+do_ctf() {
+  clone $APPLE/dtrace.git "$T_DTRACE" dtrace
+  cd "$WORK/dtrace"
+  env LD="$(xcrun -find clang)" LDPLUSPLUS="$(xcrun -find clang++)" \
+    xcodebuild install -sdk macosx -target ctfconvert -target ctfdump -target ctfmerge ARCHS="arm64" \
+    CODE_SIGN_IDENTITY="-" OBJROOT="$BLD/dtrace.obj" SYMROOT="$BLD/dtrace.sym" DSTROOT="$FR"
+  test -x "$FR/usr/local/bin/ctfconvert"
+}
+CTFARGS=""
+[ -x "$FR/usr/local/bin/ctfconvert" ] && CTFARGS="CTFCONVERT=$FR/usr/local/bin/ctfconvert CTFMERGE=$FR/usr/local/bin/ctfmerge CTFDUMP=$FR/usr/local/bin/ctfdump"
 
 # ---------------------------------------------------------------- headers
 do_xnu_headers() {
@@ -110,13 +135,13 @@ do_libsystem_hdrs() {
   cd "$WORK/Libsystem"
   sed -i '' 's|^#include.*BSD.xcconfig.*||g' Libsystem.xcconfig
   env LD="$(xcrun -find clang)" LDPLUSPLUS="$(xcrun -find clang++)" \
-    xcodebuild installhdrs -sdk "$SDK" ARCHS="arm64" VALID_ARCHS="arm64" \
+    xcodebuild installhdrs -sdk macosx ARCHS="arm64" VALID_ARCHS="arm64" \
     OBJROOT="$BLD/Libsystem.obj" SYMROOT="$BLD/Libsystem.sym" DSTROOT="$FR" FAKEROOT_DIR="$FR" CODE_SIGN_IDENTITY="-"
 }
 do_libsyscall_hdrs() {
   cd "$WORK/xnu/libsyscall"
   env LD="$(xcrun -find clang)" LDPLUSPLUS="$(xcrun -find clang++)" \
-    xcodebuild installhdrs -sdk "$SDK" TARGET_CONFIGS="$KCFG ARM64 $MCFG" ARCHS="arm64" VALID_ARCHS="arm64" \
+    xcodebuild installhdrs -sdk macosx TARGET_CONFIGS="$KCFG ARM64 $MCFG" ARCHS="arm64" VALID_ARCHS="arm64" \
     OBJROOT="$BLD/libsyscall.obj" SYMROOT="$BLD/libsyscall.sym" DSTROOT="$FR" FAKEROOT_DIR="$FR" CODE_SIGN_IDENTITY="-"
 }
 do_libplatform() {
@@ -126,10 +151,14 @@ do_libplatform() {
 }
 do_firehose() {
   cd "$WORK/libdispatch"
+  # includes de xcconfig internos da Apple (BSD.xcconfig, PlatformSupport.xcconfig) nao existem no Xcode publico
+  sed -i '' -e '/BSD.xcconfig/d' -e '/PlatformSupport.xcconfig/d' xcodeconfig/*.xcconfig
   sed -i '' "s|\$(SDKROOT)/System/Library/Frameworks/Kernel.framework/PrivateHeaders|$FR/System/Library/Frameworks/Kernel.framework/PrivateHeaders|g" xcodeconfig/libfirehose_kernel.xcconfig
   sed -i '' "s|\$(SDKROOT)/usr/local/include|$FR/usr/local/include|g" xcodeconfig/libfirehose_kernel.xcconfig
+  # includes de xcconfig internos da Apple que nao existem no Xcode publico
+  sed -i '' -e '/#include.*BSD.xcconfig/d' -e '/#include.*PlatformSupport.xcconfig/d' xcodeconfig/*.xcconfig
   env LD="$(xcrun -find clang)" LDPLUSPLUS="$(xcrun -find clang++)" \
-    xcodebuild install -target libfirehose_kernel -sdk "$SDK" ARCHS="arm64" VALID_ARCHS="arm64" \
+    xcodebuild install -target libfirehose_kernel -sdk macosx ARCHS="arm64" VALID_ARCHS="arm64" \
     OBJROOT="$BLD/firehose.obj" SYMROOT="$BLD/firehose.sym" DSTROOT="$FR" FAKEROOT_DIR="$FR" CODE_SIGN_IDENTITY="-"
   mkdir -p "$FR/usr/local/lib/kernel"
   [ -f "$FR/usr/local/lib/kernel/liblibfirehose_kernel.a" ] && mv "$FR/usr/local/lib/kernel/liblibfirehose_kernel.a" "$FR/usr/local/lib/kernel/libfirehose_kernel.a"
@@ -140,8 +169,8 @@ do_firehose() {
 # ---------------------------------------------------------------- kernel
 do_kernel() {
   cd "$WORK/xnu"
-  make install -j"$NCPU" VERBOSE=YES CONCISE=0 SDKROOT="$SDK" TARGET_CONFIGS="$KCFG ARM64 $MCFG" \
-    ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG=arm64 BUILD_WERROR=0 BUILD_LTO=0 \
+  make install_kernels -j"$NCPU" VERBOSE=YES CONCISE=0 $CTFARGS SDKROOT="$SDK" TARGET_CONFIGS="$KCFG ARM64 $MCFG" \
+    ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG=arm64 BUILD_WERROR=0 BUILD_LTO=0 DO_CTFCONVERT=0 DO_CTFMERGE=0 DO_CTFMACHO=0 \
     SRCROOT="$WORK/xnu" OBJROOT="$BLD/xnu.obj" SYMROOT="$BLD/xnu.sym" DSTROOT="$FR" FAKEROOT_DIR="$FR" \
     MEMORY_SIZE="$MEM" SYSCTL_HW_PHYSICALCPU="$PCPU" SYSCTL_HW_LOGICALCPU="$NCPU" KERNEL_BUILDS_IN_PARALLEL=1 \
     RC_DARWIN_KERNEL_VERSION=18.7.0 ${MAKE_KEEP_GOING:+-k}
@@ -151,7 +180,7 @@ collect() {
   find "$WORK" -name "kernel.$KLC*" -type f \( -perm -u+x -o -name "*.unstripped" -o -name "*.dSYM" \) 2>/dev/null | while read -r f; do cp -R "$f" "$OUT/kernel/"; done
   find "$FR" -path "*Kernels*" -name "kernel.*" -type f -exec cp {} "$OUT/kernel/" \; 2>/dev/null || true
   ls -la "$OUT/kernel"
-  ( cd "$OUT/kernel" && shasum -a 256 * > SHA256SUMS ) || true
+  ( cd "$OUT/kernel" && ls kernel.* >/dev/null 2>&1 && shasum -a 256 kernel.* > SHA256SUMS ) || true
   for f in "$OUT"/kernel/kernel.*; do [ -f "$f" ] && { file "$f"; xcrun lipo -info "$f" 2>&1 || true; }; done
 }
 
@@ -161,6 +190,8 @@ stage 01-fetch          do_fetch      || { echo "FATAL: sem fontes"; exit 2; }
 stage 02-patches-nossos do_ours       || { echo "FATAL: patch nosso nao aplicou (veja out/02-patches-nossos.log)"; exit 3; }
 stage 03-compat         do_compat
 stage 04-ferramentas    do_tools
+stage 04b-ctf-opcional  do_ctf
+CTFARGS=""; [ -x "$FR/usr/local/bin/ctfconvert" ] && CTFARGS="CTFCONVERT=$FR/usr/local/bin/ctfconvert CTFMERGE=$FR/usr/local/bin/ctfmerge CTFDUMP=$FR/usr/local/bin/ctfdump"
 stage 05-xnu-headers    do_xnu_headers
 stage 06-libsystem-hdrs do_libsystem_hdrs
 stage 07-libsyscall-hdrs do_libsyscall_hdrs

@@ -1,5 +1,5 @@
 
-#!/bin/bash
+ #!/bin/bash
 # Compila o XNU 4903 (macOS 10.14.6 / era do iOS 12) para ARM64 T7000 (A8, iPhone 6)
 # num runner macOS do GitHub Actions. Compativel com o bash 3.2 do macOS.
 #
@@ -54,7 +54,7 @@ export PATH="$STUBS:$PATH"
 # Flags que rebaixam para AVISO erros "novos" do clang moderno em codigo C de 2018
 # (declaracao implicita, int<->ponteiro, return em funcao void, etc.). Nao mudam o codigo gerado.
 COMPAT_WARN="-Wno-error=implicit-function-declaration -Wno-error=implicit-int -Wno-error=int-conversion -Wno-error=incompatible-pointer-types -Wno-error=incompatible-function-pointer-types -Wno-error=return-type -Wno-error=deprecated-non-prototype -Wno-error=strict-prototypes -Wno-error=int-to-pointer-cast -Wno-error=pointer-to-int-cast -Wno-return-type -Wno-implicit-function-declaration -Wno-int-conversion -Wno-incompatible-pointer-types -Wno-incompatible-function-pointer-types"
-SCRIPT_VERSION="v6 (2026-10-28)"
+SCRIPT_VERSION="v7 (2026-10-28)"
 
 say() { echo "[$(date +%H:%M:%S)] $*"; }
 FAILED=0
@@ -286,7 +286,10 @@ do_firehose() {
   sed -i '' "s|\$(SDKROOT)/usr/local/include|$FR/usr/local/include|g" xcodeconfig/libfirehose_kernel.xcconfig
   # includes de xcconfig internos da Apple que nao existem no Xcode publico
   sed -i '' -e '/#include.*BSD.xcconfig/d' -e '/#include.*PlatformSupport.xcconfig/d' xcodeconfig/*.xcconfig
-  printf '\nOTHER_CFLAGS = $(inherited) %s\n' "$COMPAT_WARN" >> xcodeconfig/libfirehose_kernel.xcconfig
+  # v7: NAO sobrescrever OTHER_CFLAGS (perdia -mkernel -nostdinc). Acrescenta so os -Wno-error=* na linha existente.
+  FH_WARN="$(echo "$COMPAT_WARN" | tr ' ' '\n' | grep -E '^-Wno-error=' | tr '\n' ' ')"
+  sed -i '' "s|^OTHER_CFLAGS = \(.*\)\$|OTHER_CFLAGS = \1 $FH_WARN|" xcodeconfig/libfirehose_kernel.xcconfig
+  grep -n "OTHER_CFLAGS\|GCC_PREPROCESSOR" xcodeconfig/libfirehose_kernel.xcconfig
   env LD="$(xcrun -find clang)" LDPLUSPLUS="$(xcrun -find clang++)" \
     xcodebuild install -target libfirehose_kernel -sdk macosx ARCHS="arm64" VALID_ARCHS="arm64" \
     GCC_TREAT_IMPLICIT_FUNCTION_DECLARATIONS_AS_ERRORS=NO GCC_TREAT_WARNINGS_AS_ERRORS=NO \
@@ -297,6 +300,7 @@ do_firehose() {
   test -f "$FR/usr/local/lib/kernel/libfirehose_kernel.a"
   # --- v6: a lib saiu com tag "macOS"; o link do kernel iOS recusa ("building for iOS, but linking in object file built for macOS").
   # Rotulamos cada objeto como iOS (so o load command de plataforma; o codigo arm64 e o mesmo).
+  echo "--- simbolos nao definidos da firehose (antes do retag):"; nm -u "$FR/usr/local/lib/kernel/libfirehose_kernel.a" 2>/dev/null | grep -i "firehose" | head -20
   if [ "$SDK" = "iphoneos" ]; then
     L="$FR/usr/local/lib/kernel/libfirehose_kernel.a"; T="$BLD/firehose.retag"; rm -rf "$T"; mkdir -p "$T"; cp "$L" "$T/orig.a"
     ( cd "$T" && ar x orig.a && rm -f orig.a "__.SYMDEF"* )
@@ -306,7 +310,7 @@ do_firehose() {
       vtool -show-build "$o" | sed 's/^/  [depois] /'
     done
     rm -f "$L"; libtool -static -o "$L" "$T"/*.o
-    vtool -show-build "$L" 2>&1 | head -8
+    ar t "$L"
   fi
 }
 
@@ -358,6 +362,8 @@ stage 11-coletar        collect || true
   done
   echo ""; echo "=== SIMBOLOS INDEFINIDOS NO LINK (se houver) ==="
   grep -A40 "Undefined symbols" "$OUT/10-kernel.log" 2>/dev/null | cut -c1-200 | head -60
+  echo ""; echo "=== FIREHOSE: avisos suspeitos (declaracao implicita, tipos desconhecidos) ==="
+  grep -E "implicit declaration|unknown type name|undeclared identifier|DISPATCH_PURE_C|OS_ALWAYS_INLINE" "$OUT/09-firehose.log" 2>/dev/null | sed -E 's#/Users/runner/work/[^ ]*/work/##g' | cut -c1-240 | awk '!s[$0]++' | head -30
   echo ""; echo "=== ETAPAS ==="; grep -E "^(PASS|FAIL)" "$REPORT" | awk '!s[$0]++'
 } >> "$REPORT" 2>&1
 echo "---------- RELATORIO ----------"; cat "$REPORT"

@@ -1,3 +1,4 @@
+
 #!/bin/bash
 # Compila o XNU 4903 (macOS 10.14.6 / era do iOS 12) para ARM64 T7000 (A8, iPhone 6)
 # num runner macOS do GitHub Actions. Compativel com o bash 3.2 do macOS.
@@ -53,7 +54,7 @@ export PATH="$STUBS:$PATH"
 # Flags que rebaixam para AVISO erros "novos" do clang moderno em codigo C de 2018
 # (declaracao implicita, int<->ponteiro, return em funcao void, etc.). Nao mudam o codigo gerado.
 COMPAT_WARN="-Wno-error=implicit-function-declaration -Wno-error=implicit-int -Wno-error=int-conversion -Wno-error=incompatible-pointer-types -Wno-error=incompatible-function-pointer-types -Wno-error=return-type -Wno-error=deprecated-non-prototype -Wno-error=strict-prototypes -Wno-error=int-to-pointer-cast -Wno-error=pointer-to-int-cast -Wno-return-type -Wno-implicit-function-declaration -Wno-int-conversion -Wno-incompatible-pointer-types -Wno-incompatible-function-pointer-types"
-SCRIPT_VERSION="v9 (2026-10-28)"
+SCRIPT_VERSION="v10 (2026-10-28)"
 
 say() { echo "[$(date +%H:%M:%S)] $*"; }
 FAILED=0
@@ -347,12 +348,19 @@ do_kernel() {
 }
 collect() {
   mkdir -p "$OUT/kernel"
-  find "$WORK" -name "kernel.$KLC*" -type f \( -perm -u+x -o -name "*.unstripped" -o -name "*.dSYM" \) 2>/dev/null | while read -r f; do cp -R "$f" "$OUT/kernel/"; done
-  find "$FR" -path "*Kernels*" -name "kernel.*" -type f -exec cp {} "$OUT/kernel/" \; 2>/dev/null || true
+  # v10: no build embedded o binario chama-se mach.<cfg>.<maq> (e .unstripped) dentro de xnu.obj; procura por tamanho (>1MB)
+  find "$WORK" -type f \( -name 'mach.*' -o -name 'kernel.*' -o -name '*.unstripped' \) -size +1000k 2>/dev/null \
+    | grep -v '\.o$' | grep -v '/work/xnu/' | while read -r f; do
+      n="$(echo "${f#$WORK/}" | tr '/' '_')"; echo "achado: $f ($(wc -c < "$f") bytes)"; cp "$f" "$OUT/kernel/$n"
+    done
+  echo "--- candidatos em xnu.obj:"; ls -la "$BLD"/xnu.obj/*/ 2>/dev/null | grep -E "mach|kernel" | head -20
+  echo "--- instalados no fakeroot:"; find "$FR" -type f \( -name 'kernel*' -o -name 'mach*' -o -name '*kernelcache*' \) 2>/dev/null | head -20
+  for f in "$OUT"/kernel/*; do [ -f "$f" ] || continue; file "$f"; xcrun lipo -info "$f" 2>&1 | head -2; done
+  # copia comprimida e pequena (o upload do celular tem limite): xz de cada binario
+  for f in "$OUT"/kernel/*; do [ -f "$f" ] && case "$f" in *.xz) ;; *) xz -9 -k -f "$f" 2>/dev/null || gzip -9 -k -f "$f";; esac; done
+  ( cd "$OUT/kernel" && shasum -a 256 * > SHA256SUMS 2>/dev/null ) || true
   ls -la "$OUT/kernel"
-  ( cd "$OUT/kernel" && ls kernel.* >/dev/null 2>&1 && shasum -a 256 kernel.* > SHA256SUMS ) || true
-  true
-  for f in "$OUT"/kernel/kernel.*; do [ -f "$f" ] && { file "$f"; xcrun lipo -info "$f" 2>&1 || true; }; done
+  [ -n "$(ls "$OUT"/kernel 2>/dev/null)" ]
 }
 
 say "script $SCRIPT_VERSION"; say "xnu=$XNU_TAG kcfg=$KCFG machine=$MCFG sdk=$SDK ncpu=$NCPU"
@@ -369,6 +377,58 @@ stage 08-libplatform    do_libplatform
 stage 09-firehose       do_firehose
 stage 10-kernel         do_kernel
 stage 11-coletar        collect || true
-{
-  echo ""; echo "=== ERROS MAIS FREQUENTES (todas as etapas; sem ruido de xcrun) ==="
-  cat "$OUT"/*.log 2>/dev/null | grep -E "error:" | grep -v "xcrun: error" | sed -E 's#
+python3 - "$OUT" "$REPORT" <<'PYREP' >> "$REPORT" 2>&1
+import sys, os, re, glob, collections
+out, rep = sys.argv[1], sys.argv[2]
+RUN = re.compile(r'/Users/runner/work/[^ ]*?/work/')
+def clean(s): return RUN.sub('', s)
+logs = sorted(glob.glob(os.path.join(out, '*.log')))
+def lines(p): return open(p, errors='replace').read().splitlines()
+print(); print('=== ERROS MAIS FREQUENTES (todas as etapas; sem ruido de xcrun) ===')
+c = collections.Counter()
+for p in logs:
+    for l in lines(p):
+        if 'error:' in l and 'xcrun: error' not in l:
+            l = clean(l); l = re.sub(r'^\S+ ', '', l); l = re.sub(r':\d+:\d+:', ':', l); c[l[:200]] += 1
+for l, n in c.most_common(50): print('%4d %s' % (n, l))
+print(); print('=== ARQUIVOS COM ERRO (kernel) ===')
+k = os.path.join(out, '10-kernel.log'); c = collections.Counter()
+if os.path.exists(k):
+    for l in lines(k):
+        if 'error:' in l and 'xcrun: error' not in l:
+            c[re.sub(r':\d+:\d+:.*', '', clean(l))[:160]] += 1
+for l, n in c.most_common(40): print('%4d %s' % (n, l))
+print(); print('=== TODOS OS ERROS POR ETAPA (unicos, sem caminho do runner) ===')
+pat = re.compile(r'error:|: \*\*\*|^ld: |fatal:|Undefined symbols|No such file|not found|SyntaxError')
+for p in logs:
+    ls = [l for l in lines(p) if pat.search(l) and 'xcrun: error' not in l]
+    if not ls: continue
+    print('--- %s: %d linhas de erro' % (os.path.basename(p), len(ls)))
+    seen = set()
+    for l in ls:
+        l = clean(l)[:260]
+        if l in seen: continue
+        seen.add(l); print(l)
+        if len(seen) >= 40: break
+print(); print('=== SIMBOLOS INDEFINIDOS NO LINK (se houver) ===')
+if os.path.exists(k):
+    L = lines(k)
+    for i, l in enumerate(L):
+        if 'Undefined symbols' in l:
+            print('\n'.join(x[:200] for x in L[i:i+40])); break
+print(); print('=== FIREHOSE: avisos suspeitos ===')
+f = os.path.join(out, '09-firehose.log')
+if os.path.exists(f):
+    seen = set()
+    for l in lines(f):
+        if re.search(r'implicit declaration|unknown type name|undeclared identifier', l):
+            l = clean(l)[:240]
+            if l not in seen: seen.add(l); print(l)
+print(); print('=== ETAPAS ===')
+seen = set()
+for l in lines(rep):
+    if re.match(r'(PASS|FAIL)', l) and l not in seen: seen.add(l); print(l)
+PYREP
+echo "---------- RELATORIO ----------"; cat "$REPORT"
+[ -n "$(ls "$OUT"/kernel 2>/dev/null)" ] || { echo "SEM KERNEL"; exit 1; }
+exit $FAILED

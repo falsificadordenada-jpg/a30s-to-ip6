@@ -53,7 +53,7 @@ export PATH="$STUBS:$PATH"
 # Flags que rebaixam para AVISO erros "novos" do clang moderno em codigo C de 2018
 # (declaracao implicita, int<->ponteiro, return em funcao void, etc.). Nao mudam o codigo gerado.
 COMPAT_WARN="-Wno-error=implicit-function-declaration -Wno-error=implicit-int -Wno-error=int-conversion -Wno-error=incompatible-pointer-types -Wno-error=incompatible-function-pointer-types -Wno-error=return-type -Wno-error=deprecated-non-prototype -Wno-error=strict-prototypes -Wno-error=int-to-pointer-cast -Wno-error=pointer-to-int-cast -Wno-return-type -Wno-implicit-function-declaration -Wno-int-conversion -Wno-incompatible-pointer-types -Wno-incompatible-function-pointer-types"
-SCRIPT_VERSION="v8 (2026-10-28)"
+SCRIPT_VERSION="v9 (2026-10-28)"
 
 say() { echo "[$(date +%H:%M:%S)] $*"; }
 FAILED=0
@@ -232,6 +232,9 @@ bool firehose_buffer_bank_try_reserve_slot(void *fb, bool for_io, void *state)
 CEOF
   grep -q a30s_firehose_stub osfmk/conf/files || echo 'osfmk/kern/a30s_firehose_stub.c		standard' >> osfmk/conf/files
   tail -2 osfmk/conf/files
+  # --- v9: lldbmacros (so debugger lldb) usa um verificador de sintaxe em Python 2 que quebra o config_all. Troca por no-op.
+  printf '#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n' > tools/lldbmacros/core/syntax_checker.py
+  chmod +x tools/lldbmacros/core/syntax_checker.py
   # --- v5: MT_CORE_NFIXED so existia sob KERNEL_PRIVATE; define sempre (mesmo valor, redefinicao identica e ok)
   perl -0pi -e 's/(#include <sys\/cdefs.h>\n)/$1\n#ifndef MT_CORE_NFIXED\n#define MT_CORE_NFIXED 2\n#endif\n/' osfmk/arm64/monotonic.h
   grep -n "MT_CORE_NFIXED" osfmk/arm64/monotonic.h | head -3
@@ -368,6 +371,4 @@ stage 10-kernel         do_kernel
 stage 11-coletar        collect || true
 {
   echo ""; echo "=== ERROS MAIS FREQUENTES (todas as etapas; sem ruido de xcrun) ==="
-  cat "$OUT"/*.log 2>/dev/null | grep -E "error:" | grep -v "xcrun: error" | sed -E 's#/Users/runner/work/[^ ]*/work/##g; s#^[^ ]* ##' | sed -E 's/:[0-9]+:[0-9]+:/:/' | sort | uniq -c | sort -rn | head -50
-  echo ""; echo "=== ARQUIVOS COM ERRO (kernel) ==="
-  grep -E "error:" "$OUT/10-kernel.log" 2>/dev/null | grep -v "xcrun: error" | sed -E 's#/Users/runner/work/
+  cat "$OUT"/*.log 2>/dev/null | grep -E "error:" | grep -v "xcrun: error" | sed -E 's#

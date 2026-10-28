@@ -53,7 +53,7 @@ export PATH="$STUBS:$PATH"
 # Flags que rebaixam para AVISO erros "novos" do clang moderno em codigo C de 2018
 # (declaracao implicita, int<->ponteiro, return em funcao void, etc.). Nao mudam o codigo gerado.
 COMPAT_WARN="-Wno-error=implicit-function-declaration -Wno-error=implicit-int -Wno-error=int-conversion -Wno-error=incompatible-pointer-types -Wno-error=incompatible-function-pointer-types -Wno-error=return-type -Wno-error=deprecated-non-prototype -Wno-error=strict-prototypes -Wno-error=int-to-pointer-cast -Wno-error=pointer-to-int-cast -Wno-return-type -Wno-implicit-function-declaration -Wno-int-conversion -Wno-incompatible-pointer-types -Wno-incompatible-function-pointer-types"
-SCRIPT_VERSION="v4 (2026-10-27)"
+SCRIPT_VERSION="v5 (2026-10-27)"
 
 say() { echo "[$(date +%H:%M:%S)] $*"; }
 FAILED=0
@@ -173,6 +173,48 @@ print("static size_t blacklist_entries = %d;" % len(entries))
 print("static const size_t blacklist_max_entries = %d;" % (len(entries) + EXTRA))
 PYEOF2
   chmod +x bsd/kern/makekdebugevents.py san/tools/generate_dynamic_blacklist.py
+  # --- v5: assym.s. O sed original nao reconhece o asm de clangs novos (.ascii "7" vira .byte 55)
+  cat > "$WORK/genassym_conv.py" <<'PYEOF3'
+#!/usr/bin/env python3
+"""Substitui o sed do osfmk/conf/Makefile.template que gera assym.s a partir de genassym.o
+(assembly do clang). Clangs novos reescrevem '.ascii "7"' (1 caractere) como '.byte 55', e o sed
+original nao reconhece -> labels duplicados ('symbol DEFINITION__define__X is already defined').
+Saida igual a original: '#define NOME VAL' (+ '#' se o clang imprimiu) e '#define NOME_NUM VAL'."""
+import re, sys
+lines = open(sys.argv[1], errors='replace').read().splitlines()
+lab = re.compile(r'^\s*DEFINITION__define__([A-Za-z0-9_]+):')
+asc = re.compile(r'\.ascii\s+"([^"]*)"')
+byt = re.compile(r'\.byte\s+(\d+)\s*$')
+n = 0
+for i, l in enumerate(lines):
+    m = lab.match(l)
+    if not m:
+        continue
+    text = None
+    for j in range(i + 1, min(i + 6, len(lines))):
+        a = asc.search(lines[j]); b = byt.search(lines[j])
+        if a: text = a.group(1); break
+        if b: text = chr(int(b.group(1))); break
+    if text is None:
+        sys.stderr.write('sem valor para %s\n' % m.group(1)); sys.exit(1)
+    text = text.lstrip('$')
+    hashp = '#' if text.startswith('#') else ''
+    v = text.lstrip('#')
+    if not re.fullmatch(r'-?(0x[0-9a-fA-F]+|\d+)', v):
+        sys.stderr.write('valor estranho %r para %s\n' % (text, m.group(1))); sys.exit(1)
+    if v.lower().lstrip('-').startswith('0x'):
+        v = str(int(v, 16))
+    print('#define %s %s%s' % (m.group(1), hashp, v))
+    print('#define %s_NUM %s' % (m.group(1), v))
+    n += 1
+sys.stderr.write('genassym_conv: %d simbolos\n' % n)
+sys.exit(0 if n else 1)
+PYEOF3
+  perl -pi -e 'if (/^\t\$\(_v\)sed -e .\/\^\[\[:space:\]\]\*DEFINITION__define__/) { $_ = "\t\$(_v)python3 '"$WORK"'/genassym_conv.py genassym.o > \$@\n"; }' osfmk/conf/Makefile.template
+  grep -n "genassym_conv" osfmk/conf/Makefile.template
+  # --- v5: MT_CORE_NFIXED so existia sob KERNEL_PRIVATE; define sempre (mesmo valor, redefinicao identica e ok)
+  perl -0pi -e 's/(#include <sys\/cdefs.h>\n)/$1\n#ifndef MT_CORE_NFIXED\n#define MT_CORE_NFIXED 2\n#endif\n/' osfmk/arm64/monotonic.h
+  grep -n "MT_CORE_NFIXED" osfmk/arm64/monotonic.h | head -3
   # o alvo "install" completo chama checkstyle (tools/uncrustify.sh nao existe no fonte publico)
   sed -i '' 's/install_aliases checkstyle$/install_aliases/' makedefs/MakeInc.top
   grep -n "LDFLAGS_KERNEL_SDK\|INCFLAGS_SDK" makedefs/MakeInc.def | head

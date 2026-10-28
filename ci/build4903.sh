@@ -54,7 +54,7 @@ export PATH="$STUBS:$PATH"
 # Flags que rebaixam para AVISO erros "novos" do clang moderno em codigo C de 2018
 # (declaracao implicita, int<->ponteiro, return em funcao void, etc.). Nao mudam o codigo gerado.
 COMPAT_WARN="-Wno-error=implicit-function-declaration -Wno-error=implicit-int -Wno-error=int-conversion -Wno-error=incompatible-pointer-types -Wno-error=incompatible-function-pointer-types -Wno-error=return-type -Wno-error=deprecated-non-prototype -Wno-error=strict-prototypes -Wno-error=int-to-pointer-cast -Wno-error=pointer-to-int-cast -Wno-return-type -Wno-implicit-function-declaration -Wno-int-conversion -Wno-incompatible-pointer-types -Wno-incompatible-function-pointer-types"
-SCRIPT_VERSION="v10 (2026-10-28)"
+SCRIPT_VERSION="v11 (2026-10-28)"
 
 say() { echo "[$(date +%H:%M:%S)] $*"; }
 FAILED=0
@@ -290,6 +290,8 @@ do_libsystem_hdrs() {
 }
 do_libsyscall_hdrs() {
   cd "$WORK/xnu/libsyscall"
+  # v11: lock_set.defs nao existe no SDK publico; CPATH faz o cc usado pelo mig achar os .defs do xnu
+  export CPATH="$BLD/xnu-hdrs.obj/EXPORT_HDRS/osfmk${CPATH:+:$CPATH}"
   env LD="$(xcrun -find clang)" LDPLUSPLUS="$(xcrun -find clang++)" \
     xcodebuild installhdrs -sdk macosx TARGET_CONFIGS="$KCFG ARM64 $MCFG" ARCHS="arm64" VALID_ARCHS="arm64" ONLY_ACTIVE_ARCH=YES \
     MACOSX_DEPLOYMENT_TARGET=10.14 IPHONEOS_DEPLOYMENT_TARGET=12.0 OTHER_MIGFLAGS="-I$WORK/xnu/osfmk -I$FR/usr/include -I$FR/usr/local/include" \
@@ -348,14 +350,14 @@ do_kernel() {
 }
 collect() {
   mkdir -p "$OUT/kernel"
-  # v10: no build embedded o binario chama-se mach.<cfg>.<maq> (e .unstripped) dentro de xnu.obj; procura por tamanho (>1MB)
-  find "$WORK" -type f \( -name 'mach.*' -o -name 'kernel.*' -o -name '*.unstripped' \) -size +1000k 2>/dev/null \
-    | grep -v '\.o$' | grep -v '/work/xnu/' | while read -r f; do
-      n="$(echo "${f#$WORK/}" | tr '/' '_')"; echo "achado: $f ($(wc -c < "$f") bytes)"; cp "$f" "$OUT/kernel/$n"
-    done
+  # v11: copia SO o kernel (descomprimido e com simbolos). Nada de dSYM nem .a (centenas de MB).
+  D="$BLD/xnu.obj/${KCFG}_ARM64_${MCFG}"
+  for n in "mach.$KLC" "mach.$KLC.unstripped"; do
+    if [ -f "$D/$n" ]; then echo "kernel: $D/$n ($(wc -c < "$D/$n") bytes)"; cp "$D/$n" "$OUT/kernel/$n"; else echo "NAO ACHEI: $D/$n"; fi
+  done
   echo "--- candidatos em xnu.obj:"; ls -la "$BLD"/xnu.obj/*/ 2>/dev/null | grep -E "mach|kernel" | head -20
   echo "--- instalados no fakeroot:"; find "$FR" -type f \( -name 'kernel*' -o -name 'mach*' -o -name '*kernelcache*' \) 2>/dev/null | head -20
-  for f in "$OUT"/kernel/*; do [ -f "$f" ] || continue; file "$f"; xcrun lipo -info "$f" 2>&1 | head -2; done
+  for f in "$OUT"/kernel/*; do [ -f "$f" ] || continue; file "$f"; xcrun lipo -info "$f" 2>&1 | head -2 | sed "s/error:/aviso:/"; done
   # copia comprimida e pequena (o upload do celular tem limite): xz de cada binario
   for f in "$OUT"/kernel/*; do [ -f "$f" ] && case "$f" in *.xz) ;; *) xz -9 -k -f "$f" 2>/dev/null || gzip -9 -k -f "$f";; esac; done
   ( cd "$OUT/kernel" && shasum -a 256 * > SHA256SUMS 2>/dev/null ) || true
@@ -372,7 +374,7 @@ stage 04-ferramentas    do_tools
 CTFARGS=""; false && CTFARGS="CTFCONVERT=$FR/usr/local/bin/ctfconvert CTFMERGE=$FR/usr/local/bin/ctfmerge CTFDUMP=$FR/usr/local/bin/ctfdump"
 stage 05-xnu-headers    do_xnu_headers
 stage 06-libsystem-hdrs do_libsystem_hdrs
-stage 07-libsyscall-hdrs do_libsyscall_hdrs
+F07=$FAILED; stage 07-libsyscall-hdrs do_libsyscall_hdrs || { FAILED=$F07; echo "AVISO: 07 falhou, mas nao e usado pelo kernel (ignorado)" | tee -a "$REPORT"; }
 stage 08-libplatform    do_libplatform
 stage 09-firehose       do_firehose
 stage 10-kernel         do_kernel

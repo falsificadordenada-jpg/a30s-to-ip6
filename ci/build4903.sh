@@ -1,5 +1,4 @@
-
- #!/bin/bash
+#!/bin/bash
 # Compila o XNU 4903 (macOS 10.14.6 / era do iOS 12) para ARM64 T7000 (A8, iPhone 6)
 # num runner macOS do GitHub Actions. Compativel com o bash 3.2 do macOS.
 #
@@ -54,7 +53,7 @@ export PATH="$STUBS:$PATH"
 # Flags que rebaixam para AVISO erros "novos" do clang moderno em codigo C de 2018
 # (declaracao implicita, int<->ponteiro, return em funcao void, etc.). Nao mudam o codigo gerado.
 COMPAT_WARN="-Wno-error=implicit-function-declaration -Wno-error=implicit-int -Wno-error=int-conversion -Wno-error=incompatible-pointer-types -Wno-error=incompatible-function-pointer-types -Wno-error=return-type -Wno-error=deprecated-non-prototype -Wno-error=strict-prototypes -Wno-error=int-to-pointer-cast -Wno-error=pointer-to-int-cast -Wno-return-type -Wno-implicit-function-declaration -Wno-int-conversion -Wno-incompatible-pointer-types -Wno-incompatible-function-pointer-types"
-SCRIPT_VERSION="v7 (2026-10-28)"
+SCRIPT_VERSION="v8 (2026-10-28)"
 
 say() { echo "[$(date +%H:%M:%S)] $*"; }
 FAILED=0
@@ -213,6 +212,26 @@ sys.exit(0 if n else 1)
 PYEOF3
   perl -pi -e 'if (/^\t\$\(_v\)sed -e .\/\^\[\[:space:\]\]\*DEFINITION__define__/) { $_ = "\t\$(_v)python3 '"$WORK"'/genassym_conv.py genassym.o > \$@\n"; }' osfmk/conf/Makefile.template
   grep -n "genassym_conv" osfmk/conf/Makefile.template
+  # --- v8: libfirehose_kernel.a sai sem 3 funcoes (static inline do header nao foram geradas e viram chamadas externas).
+  # Stub de bring-up: sem firehose o os_log do kernel simplesmente descarta mensagens (log.c trata reserve==NULL).
+  cat > osfmk/kern/a30s_firehose_stub.c <<'CEOF'
+/* Stub A30s: funcoes que a libfirehose_kernel.a deixa sem definicao neste toolchain. */
+#include <stdint.h>
+#include <stdbool.h>
+void *firehose_buffer_tracepoint_reserve(void *fb, uint64_t stamp, int stream, uint16_t pubsize,
+    uint16_t privsize, uint8_t **privptr, bool reliable);
+void firehose_buffer_tracepoint_flush(void *fb, void *ft, uint64_t ftid);
+bool firehose_buffer_bank_try_reserve_slot(void *fb, bool for_io, void *state);
+void *firehose_buffer_tracepoint_reserve(void *fb, uint64_t stamp, int stream, uint16_t pubsize,
+    uint16_t privsize, uint8_t **privptr, bool reliable)
+{ (void)fb; (void)stamp; (void)stream; (void)pubsize; (void)privsize; (void)privptr; (void)reliable; return (void *)0; }
+void firehose_buffer_tracepoint_flush(void *fb, void *ft, uint64_t ftid)
+{ (void)fb; (void)ft; (void)ftid; }
+bool firehose_buffer_bank_try_reserve_slot(void *fb, bool for_io, void *state)
+{ (void)fb; (void)for_io; (void)state; return false; }
+CEOF
+  grep -q a30s_firehose_stub osfmk/conf/files || echo 'osfmk/kern/a30s_firehose_stub.c		standard' >> osfmk/conf/files
+  tail -2 osfmk/conf/files
   # --- v5: MT_CORE_NFIXED so existia sob KERNEL_PRIVATE; define sempre (mesmo valor, redefinicao identica e ok)
   perl -0pi -e 's/(#include <sys\/cdefs.h>\n)/$1\n#ifndef MT_CORE_NFIXED\n#define MT_CORE_NFIXED 2\n#endif\n/' osfmk/arm64/monotonic.h
   grep -n "MT_CORE_NFIXED" osfmk/arm64/monotonic.h | head -3
@@ -351,21 +370,4 @@ stage 11-coletar        collect || true
   echo ""; echo "=== ERROS MAIS FREQUENTES (todas as etapas; sem ruido de xcrun) ==="
   cat "$OUT"/*.log 2>/dev/null | grep -E "error:" | grep -v "xcrun: error" | sed -E 's#/Users/runner/work/[^ ]*/work/##g; s#^[^ ]* ##' | sed -E 's/:[0-9]+:[0-9]+:/:/' | sort | uniq -c | sort -rn | head -50
   echo ""; echo "=== ARQUIVOS COM ERRO (kernel) ==="
-  grep -E "error:" "$OUT/10-kernel.log" 2>/dev/null | grep -v "xcrun: error" | sed -E 's#/Users/runner/work/[^ ]*/work/##; s/:[0-9]+:[0-9]+:.*//' | sort | uniq -c | sort -rn | head -40
-  echo ""; echo "=== TODOS OS ERROS POR ETAPA (unicos, sem caminho do runner) ==="
-  for L in "$OUT"/*.log; do
-    N="$(grep -E "error:|: \*\*\*|^ld: |fatal:|Undefined symbols|No such file|not found" "$L" | grep -v "xcrun: error" | wc -l | tr -d ' ')"
-    [ "$N" -gt 0 ] || continue
-    echo "--- $(basename "$L"): $N linhas de erro"
-    grep -E "error:|: \*\*\*|^ld: |fatal:|Undefined symbols|No such file|not found" "$L" | grep -v "xcrun: error" \
-      | sed -E 's#/Users/runner/work/[^ ]*/work/##g' | cut -c1-260 | awk '!seen[$0]++' | head -40
-  done
-  echo ""; echo "=== SIMBOLOS INDEFINIDOS NO LINK (se houver) ==="
-  grep -A40 "Undefined symbols" "$OUT/10-kernel.log" 2>/dev/null | cut -c1-200 | head -60
-  echo ""; echo "=== FIREHOSE: avisos suspeitos (declaracao implicita, tipos desconhecidos) ==="
-  grep -E "implicit declaration|unknown type name|undeclared identifier|DISPATCH_PURE_C|OS_ALWAYS_INLINE" "$OUT/09-firehose.log" 2>/dev/null | sed -E 's#/Users/runner/work/[^ ]*/work/##g' | cut -c1-240 | awk '!s[$0]++' | head -30
-  echo ""; echo "=== ETAPAS ==="; grep -E "^(PASS|FAIL)" "$REPORT" | awk '!s[$0]++'
-} >> "$REPORT" 2>&1
-echo "---------- RELATORIO ----------"; cat "$REPORT"
-[ -n "$(ls "$OUT"/kernel/kernel.* 2>/dev/null)" ] || { echo "SEM KERNEL"; exit 1; }
-exit $FAILED
+  grep -E "error:" "$OUT/10-kernel.log" 2>/dev/null | grep -v "xcrun: error" | sed -E 's#/Users/runner/work/

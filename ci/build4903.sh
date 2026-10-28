@@ -1,3 +1,4 @@
+
 #!/bin/bash
 # Compila o XNU 4903 (macOS 10.14.6 / era do iOS 12) para ARM64 T7000 (A8, iPhone 6)
 # num runner macOS do GitHub Actions. Compativel com o bash 3.2 do macOS.
@@ -53,7 +54,7 @@ export PATH="$STUBS:$PATH"
 # Flags que rebaixam para AVISO erros "novos" do clang moderno em codigo C de 2018
 # (declaracao implicita, int<->ponteiro, return em funcao void, etc.). Nao mudam o codigo gerado.
 COMPAT_WARN="-Wno-error=implicit-function-declaration -Wno-error=implicit-int -Wno-error=int-conversion -Wno-error=incompatible-pointer-types -Wno-error=incompatible-function-pointer-types -Wno-error=return-type -Wno-error=deprecated-non-prototype -Wno-error=strict-prototypes -Wno-error=int-to-pointer-cast -Wno-error=pointer-to-int-cast -Wno-return-type -Wno-implicit-function-declaration -Wno-int-conversion -Wno-incompatible-pointer-types -Wno-incompatible-function-pointer-types"
-SCRIPT_VERSION="v5 (2026-10-27)"
+SCRIPT_VERSION="v6 (2026-10-28)"
 
 say() { echo "[$(date +%H:%M:%S)] $*"; }
 FAILED=0
@@ -268,7 +269,7 @@ do_libsyscall_hdrs() {
   cd "$WORK/xnu/libsyscall"
   env LD="$(xcrun -find clang)" LDPLUSPLUS="$(xcrun -find clang++)" \
     xcodebuild installhdrs -sdk macosx TARGET_CONFIGS="$KCFG ARM64 $MCFG" ARCHS="arm64" VALID_ARCHS="arm64" ONLY_ACTIVE_ARCH=YES \
-    MACOSX_DEPLOYMENT_TARGET=10.14 IPHONEOS_DEPLOYMENT_TARGET=12.0 \
+    MACOSX_DEPLOYMENT_TARGET=10.14 IPHONEOS_DEPLOYMENT_TARGET=12.0 OTHER_MIGFLAGS="-I$WORK/xnu/osfmk -I$FR/usr/include -I$FR/usr/local/include" \
     OBJROOT="$BLD/libsyscall.obj" SYMROOT="$BLD/libsyscall.sym" DSTROOT="$FR" FAKEROOT_DIR="$FR" CODE_SIGN_IDENTITY="-"
 }
 do_libplatform() {
@@ -294,6 +295,19 @@ do_firehose() {
   [ -f "$FR/usr/local/lib/kernel/liblibfirehose_kernel.a" ] && mv "$FR/usr/local/lib/kernel/liblibfirehose_kernel.a" "$FR/usr/local/lib/kernel/libfirehose_kernel.a"
   ls -la "$FR/usr/local/lib/kernel"
   test -f "$FR/usr/local/lib/kernel/libfirehose_kernel.a"
+  # --- v6: a lib saiu com tag "macOS"; o link do kernel iOS recusa ("building for iOS, but linking in object file built for macOS").
+  # Rotulamos cada objeto como iOS (so o load command de plataforma; o codigo arm64 e o mesmo).
+  if [ "$SDK" = "iphoneos" ]; then
+    L="$FR/usr/local/lib/kernel/libfirehose_kernel.a"; T="$BLD/firehose.retag"; rm -rf "$T"; mkdir -p "$T"; cp "$L" "$T/orig.a"
+    ( cd "$T" && ar x orig.a && rm -f orig.a "__.SYMDEF"* )
+    for o in "$T"/*.o; do
+      vtool -show-build "$o" | sed 's/^/  [antes] /'
+      vtool -set-build-version ios 12.0 18.0 -replace -output "$o.new" "$o" && mv "$o.new" "$o"
+      vtool -show-build "$o" | sed 's/^/  [depois] /'
+    done
+    rm -f "$L"; libtool -static -o "$L" "$T"/*.o
+    vtool -show-build "$L" 2>&1 | head -8
+  fi
 }
 
 # ---------------------------------------------------------------- kernel
@@ -334,6 +348,17 @@ stage 11-coletar        collect || true
   cat "$OUT"/*.log 2>/dev/null | grep -E "error:" | grep -v "xcrun: error" | sed -E 's#/Users/runner/work/[^ ]*/work/##g; s#^[^ ]* ##' | sed -E 's/:[0-9]+:[0-9]+:/:/' | sort | uniq -c | sort -rn | head -50
   echo ""; echo "=== ARQUIVOS COM ERRO (kernel) ==="
   grep -E "error:" "$OUT/10-kernel.log" 2>/dev/null | grep -v "xcrun: error" | sed -E 's#/Users/runner/work/[^ ]*/work/##; s/:[0-9]+:[0-9]+:.*//' | sort | uniq -c | sort -rn | head -40
+  echo ""; echo "=== TODOS OS ERROS POR ETAPA (unicos, sem caminho do runner) ==="
+  for L in "$OUT"/*.log; do
+    N="$(grep -E "error:|: \*\*\*|^ld: |fatal:|Undefined symbols|No such file|not found" "$L" | grep -v "xcrun: error" | wc -l | tr -d ' ')"
+    [ "$N" -gt 0 ] || continue
+    echo "--- $(basename "$L"): $N linhas de erro"
+    grep -E "error:|: \*\*\*|^ld: |fatal:|Undefined symbols|No such file|not found" "$L" | grep -v "xcrun: error" \
+      | sed -E 's#/Users/runner/work/[^ ]*/work/##g' | cut -c1-260 | awk '!seen[$0]++' | head -40
+  done
+  echo ""; echo "=== SIMBOLOS INDEFINIDOS NO LINK (se houver) ==="
+  grep -A40 "Undefined symbols" "$OUT/10-kernel.log" 2>/dev/null | cut -c1-200 | head -60
+  echo ""; echo "=== ETAPAS ==="; grep -E "^(PASS|FAIL)" "$REPORT" | awk '!s[$0]++'
 } >> "$REPORT" 2>&1
 echo "---------- RELATORIO ----------"; cat "$REPORT"
 [ -n "$(ls "$OUT"/kernel/kernel.* 2>/dev/null)" ] || { echo "SEM KERNEL"; exit 1; }
